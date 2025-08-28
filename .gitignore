@@ -11,5 +11,5 @@ faces/
 *.xlsx
 *.jpg
 *.png
-models/**
+# models/** (included for immediate use)
 entreecounter/
