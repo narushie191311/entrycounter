@@ -31,6 +31,7 @@ import torch
 from torchvision import models
 import torchvision.transforms as T
 import subprocess
+import shutil
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 
@@ -83,6 +84,18 @@ def segments_intersect(p1, p2, q1, q2):
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
+def select_device_prefer_gpu():
+    """CUDA -> MPS(Apple Silicon) -> CPU の優先度でtorchデバイスを返す"""
+    try:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        # Apple Silicon Metal Performance Shaders
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            return torch.device("mps")
+    except Exception:
+        pass
+    return torch.device("cpu")
 
 # ========= クリックGUI（ポリゴン・ライン・アンカー収集） =========
 
@@ -171,21 +184,25 @@ class HomographyWarp:
                               criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 30, 0.01))
         self.ok_count = len(anchors_ref)
         self.ref_anchors = anchors_ref.copy()
+        self.H_total = np.eye(3, dtype=np.float32)  # ★ 追加：基準→現在の累積
 
     def update(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         p1, st, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.p0, None, **self.lk_params)
         good_old = self.p0[st==1].reshape(-1,2)
         good_new = p1[st==1].reshape(-1,2)
-        H = None
+        H_inc = None
         if len(good_old)>=4:
-            H, mask = cv2.findHomography(good_old, good_new, cv2.RANSAC, 3.0)
+            H_inc, mask = cv2.findHomography(good_old, good_new, cv2.RANSAC, 3.0)
             self.ok_count = int(mask.sum()) if mask is not None else len(good_old)
+            if H_inc is not None:
+                # ★ 追加：累積（基準→現在）= （前→現在）×（基準→前）
+                self.H_total = (H_inc @ self.H_total).astype(np.float32)
         else:
             self.ok_count = 0
         self.prev_gray = gray
         self.p0 = p1
-        return H, good_old, good_new
+        return self.H_total, good_old, good_new  # ★ 累積を返す
 
     def reinit(self, frame, anchors_ref):
         """大きくズレた場合に呼ぶ。再クリックしたアンカーで初期化"""
@@ -193,6 +210,7 @@ class HomographyWarp:
         self.p0 = anchors_ref.reshape(-1,1,2).astype(np.float32)
         self.ok_count = len(anchors_ref)
         self.ref_anchors = anchors_ref.copy()
+        self.H_total = np.eye(3, dtype=np.float32)  # ★ リセット
 
 def warp_shape(shape_xy, H):
     """N×2のxyをHで射影"""
@@ -206,16 +224,23 @@ class DetectorTracker:
     """
     Ultralytics YOLO + 内部トラッカー（ByteTrack）に対応
     """
-    def __init__(self, model_path="yolov8n.pt", conf=0.25):
+    def __init__(self, model_path="yolov8n.pt", conf=0.25, device: str = None):
         self.model = YOLO(model_path)
         self.conf = conf
+        # device指定（cuda/mps/cpu）。Noneなら自動選択
+        self.device = device
 
     def iter_track(self, source):
         """
         yield per-frame results:
         boxes: list of dict {xyxy:(x1,y1,x2,y2), conf:float, id:int or None}
         """
-        results = self.model.track(source=source, classes=[0], conf=self.conf, stream=True, tracker="bytetrack.yaml", verbose=False)
+        # Ultralyticsのtrackはmodel.to(device)で切替、もしくは引数deviceで指定
+        dev = self.device
+        if dev is None:
+            d = select_device_prefer_gpu()
+            dev = str(d)
+        results = self.model.track(source=source, classes=[0], conf=self.conf, stream=True, tracker="bytetrack.yaml", verbose=False, device=dev)
         for r in results:
             boxes = []
             if r.boxes is not None and len(r.boxes)>0:
@@ -350,12 +375,15 @@ class EntryCounter:
 class FaceEmbedder:
     """人の再識別の基礎用に、汎用の画像埋め込み（ResNet50のavgpool）を保存。
     本格ReIDモデルではないが、コサイン類似度ベースの後処理の手がかりにする。"""
-    def __init__(self):
-        self.device = "cpu"
+    def __init__(self, device: str = None):
+        if device is None:
+            self.device = str(select_device_prefer_gpu())
+        else:
+            self.device = device
         self.model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
         self.model.fc = torch.nn.Identity()
         self.model.eval()
-        self.model.to(self.device)
+        self.model.to(self.device)  # ★
         self.tf = T.Compose([
             T.ToPILImage(),
             T.Resize((224,224), interpolation=T.InterpolationMode.BILINEAR),
@@ -554,12 +582,34 @@ class FaceBestKeeper:
                 emb = None
                 if self.embedder is not None:
                     emb = self.embedder.embed(face)
-                if cur is None or sc > cur["score"]:
-                    self.best[tid] = dict(img=face.copy(), score=sc, ts=ts_iso,
-                                          age=None, gender=None, gender_conf=None,
-                                          emb=emb, age_df=age_df if age_df is not None else (cur.get('age_df') if cur else None),
-                                          gender_df=gender_df if gender_df is not None else (cur.get('gender_df') if cur else None),
-                                          gender_conf_df=gender_conf_df if gender_conf_df is not None else (cur.get('gender_conf_df') if cur else None))
+                update_best_image = (cur is None) or (sc > cur.get("score", -1))
+                if update_best_image:
+                    self.best[tid] = dict(
+                        img=face.copy(),
+                        score=sc,
+                        ts=ts_iso,
+                        age=None,
+                        gender=None,
+                        gender_conf=None,
+                        emb=emb,
+                        age_df=age_df if age_df is not None else (cur.get('age_df') if cur else None),
+                        gender_df=gender_df if gender_df is not None else (cur.get('gender_df') if cur else None),
+                        gender_conf_df=gender_conf_df if gender_conf_df is not None else (cur.get('gender_conf_df') if cur else None),
+                        attr_quality=sc if (age_df is not None or gender_df is not None or gender_conf_df is not None) else cur.get('attr_quality') if cur else sc,
+                    )
+                else:
+                    # 画像は更新しないが、見え方(sc)が良いかDF信頼度が上がった時だけ属性を更新
+                    info_cur = cur
+                    better_view = sc > info_cur.get('attr_quality', -1)
+                    better_conf = (gender_conf_df is not None) and (gender_conf_df > (info_cur.get('gender_conf_df') if info_cur.get('gender_conf_df') is not None else -1))
+                    if (better_view or better_conf) and (age_df is not None or gender_df is not None or gender_conf_df is not None):
+                        if age_df is not None:
+                            info_cur['age_df'] = age_df
+                        if gender_df is not None:
+                            info_cur['gender_df'] = gender_df
+                        if gender_conf_df is not None:
+                            info_cur['gender_conf_df'] = gender_conf_df
+                        info_cur['attr_quality'] = sc
                     self._maybe_update_alias(tid)
                     try:
                         self._write_live_face(tid)
@@ -599,7 +649,23 @@ class FaceBestKeeper:
                 ])
         embs = {str(tid): self.best[tid]["emb"] for tid in self.best if self.best[tid].get("emb") is not None}
         if len(embs) > 0:
-            np.savez(os.path.join(self.outdir, "faces_embeddings.npz"), **embs)
+            # カメラIDをキーに含めて保存（他動画と併用しやすく）
+            embs_with_cam = {f"{camera_id}_{tid}": emb for tid, emb in embs.items()}
+            np.savez(os.path.join(self.outdir, "faces_embeddings.npz"), **embs_with_cam)
+            # 参照用の簡易インデックス
+            try:
+                import csv as _csv2
+                with open(os.path.join(self.outdir, "faces_embeddings_index.csv"), "w", newline="", encoding="utf-8") as f:
+                    w = _csv2.writer(f)
+                    w.writerow(["key","camera_id","track_id_local","ts","gender_df","age_df"]) 
+                    for tid in sorted(self.best.keys()):
+                        info = self.best[tid]
+                        if info.get("emb") is None:
+                            continue
+                        key = f"{camera_id}_{tid}"
+                        w.writerow([key, camera_id, tid, info.get("ts"), info.get("gender_df"), info.get("age_df")])
+            except Exception:
+                pass
         if self.sheet_path:
             items = list(self.best.items())[:self.max_sheet_faces]
             if len(items) > 0:
@@ -623,7 +689,17 @@ class FaceBestKeeper:
                     ent_iso, ext_iso = (None, None)
                     if fps is not None and base_ts is not None:
                         ent_iso, ext_iso = self._entry_exit_iso(tid, fps, base_ts)
-                    label = f"ID:{tid}  DF:{(info.get('gender_df') or '?')}/{(info.get('age_df') or '?')}\nentry:{ent_iso or '-'}  exit:{ext_iso or '-'}"
+                    # 秒以下を切り捨て（見やすさ優先）し、2行表示
+                    def _fmt(ts):
+                        if ts is None:
+                            return '-'
+                        try:
+                            t = dt.datetime.fromisoformat(ts)
+                            t = t.replace(second=0, microsecond=0)
+                            return t.isoformat()
+                        except Exception:
+                            return ts
+                    label = f"ID:{tid}  DF:{(info.get('gender_df') or '?')}/{(info.get('age_df') or '?')}\nentry:{_fmt(ent_iso)}\nexit:{_fmt(ext_iso)}"
                     draw.text((x0, y0+thumb_h+6), label, fill=(20,20,20), font=font)
                 sheet.save(self.sheet_path)
                 print(f"[SAVE] faces sheet -> {self.sheet_path}")
@@ -746,9 +822,41 @@ def main():
     ap.add_argument("--faces-sheet-max", type=int, default=100, help="顔一覧に載せる最大人数")
     ap.add_argument("--df-warmup-frames", type=int, default=2, help="DeepFaceを初出現時に連続で走らせるフレーム数")
     ap.add_argument("--df-reinfer-interval", type=int, default=60, help="DeepFaceの再推定間隔フレーム（0で毎フレーム）")
-    ap.add_argument("--autosave-sec", type=int, default=0, help="定期自動保存の秒間隔(0で無効)")
+    ap.add_argument("--autosave-sec", type=int, default=120, help="定期自動保存の秒間隔(0で無効)")
     ap.add_argument("--log-detections", default=None, help="検出ログCSVの保存先パス(未指定で無効)")
+    ap.add_argument("--display-fps", type=float, default=15.0,
+                    help="表示の目標fps（処理は全フレーム、表示のみこのfpsで間引き）")
+    ap.add_argument("--display-skip", type=int, default=9,
+                    help="表示をNフレームごとに1回だけ（例: 9→10フレに1回表示）")
+    ap.add_argument("--start-speed", type=float, default=30.0,
+                    help="起動時の再生倍率（例: 30.0で30倍速）")
     args = ap.parse_args()
+
+    # 出力先に作成日時を付与（区別しやすくする）
+    def _has_ts(s: str) -> bool:
+        import re
+        return re.search(r"\d{8}_\d{6}", s) is not None
+    now_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not _has_ts(args.outdir):
+        args.outdir = f"{args.outdir}_{now_ts}"
+
+    # 既存の出力をアーカイブへ移動
+    try:
+        archive_root = f"archive_{now_ts}"
+        os.makedirs(archive_root, exist_ok=True)
+        cur = os.getcwd()
+        for name in os.listdir(cur):
+            try:
+                if name == os.path.basename(args.outdir):
+                    continue
+                if not os.path.isdir(name):
+                    continue
+                if name.startswith("output") or name.startswith("merged_test_output"):
+                    shutil.move(name, os.path.join(archive_root, name))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # 入力ソース（必要ならサブクリップを作成）
     source_path = args.video
@@ -833,7 +941,9 @@ def main():
     warp = HomographyWarp(ref, anchors_ref)
 
     # 検出トラッカー
-    dettrk = DetectorTracker(args.model, args.conf)
+    # デバイス自動選択（cuda -> mps -> cpu）
+    dev = str(select_device_prefer_gpu())
+    dettrk = DetectorTracker(args.model, args.conf, device=dev)
 
     # オーバーレイ動画
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -844,12 +954,14 @@ def main():
 
     # 再生状態
     paused = False
-    speed = clamp(args.speed, 0.1, 30.0)  # 倍速
+    speed = clamp(getattr(args, "start_speed", args.speed), 0.1, 120.0)
     process_stride = 1  # 2で半分の頻度で重処理、見た目の速度向上
     hard_mask = args.hard_mask
     base_ts = parse_time_from_filename(args.video)
     curr_idx = 0
     prev_boxes = []
+    last_show_t = 0.0
+    display_interval = 1.0 / max(args.display_fps, 1e-3)
     # FPS計測とログ準備
     os.makedirs(args.outdir, exist_ok=True)
     perf_path = os.path.join(args.outdir, "perf_fps.csv")
@@ -895,7 +1007,7 @@ def main():
         gender_prototxt=args.gender_prototxt,
         gender_caffemodel=args.gender_caffemodel,
     )
-    embedder = FaceEmbedder()
+    embedder = FaceEmbedder(device=dev)
     sheet_path = args.faces_sheet or os.path.join(args.outdir, "faces_sheet.jpg")
     face_keeper = FaceBestKeeper(
         outdir=args.outdir,
@@ -918,6 +1030,25 @@ def main():
     cv2.namedWindow("Overlay", cv2.WINDOW_NORMAL)
 
     # メインループ
+    def _on_exit():
+        # 安全な終了時出力
+        try:
+            counter.save_csvs(args.outdir)
+        except Exception:
+            pass
+        try:
+            stay.finalize_all(curr_idx)
+            stay.save_csv(args.outdir, fps, base_ts)
+        except Exception:
+            pass
+        try:
+            face_keeper.save_all(args.cam_id, fps=fps, base_ts=base_ts)
+        except Exception:
+            pass
+    try:
+        atexit.register(_on_exit)
+    except Exception:
+        pass
     for (boxes, frame) in stream:
         curr_idx += 1
         # ストライド処理（見た目速度の改善）
@@ -1009,15 +1140,37 @@ def main():
             x1,y1,x2,y2 = int(b["x1"]),int(b["y1"]),int(b["x2"]),int(b["y2"])
             tid = b["tid"]
             cv2.rectangle(vis, (x1,y1),(x2,y2),(80,160,255),2)
-            cv2.putText(vis, f"ID:{tid}", (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80,160,255),2)
+            label = f"ID:{tid}"
             info = face_keeper.best.get(tid)
+            if info is not None:
+                g = info.get('gender_df')
+                a = info.get('age_df')
+                if g is not None or a is not None:
+                    ga = f" {g or '?'}-{a if a is not None else '?'}"
+                    label += ga
+            cv2.putText(vis, label, (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80,160,255),2)
             if info is not None and (curr_idx % max(1, int(fps))) == 0:
                 print(f"[AGE/GENDER] tid={tid} DF=({info.get('gender_df')},{info.get('age_df')}) @ {ts_iso}")
 
         txt = f"fps:{fps:.1f}  speed:x{speed:.2f}  anchors:{warp.ok_count}  events:{len(counter.events)}  mask:{'HARD' if hard_mask else 'SOFT'}"
+        txt2 = "keys: +/- speed, SPACE pause, H mask, R re-anchor, Q quit"
         cv2.putText(vis, txt, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40,240,40),2)
-        cv2.imshow("Overlay", vis)
-        vw.write(vis)
+        cv2.putText(vis, txt2, (10,58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200),2)
+        vw.write(vis)  # 録画は毎フレーム
+
+        # 表示の間引き制御
+        do_show = False
+        if (curr_idx % (args.display_skip + 1)) == 0:
+            now_show = time.perf_counter()
+            if (now_show - last_show_t) >= display_interval:
+                do_show = True
+                last_show_t = now_show
+
+        if do_show:
+            cv2.imshow("Overlay", vis)
+            key = cv2.waitKey(1) & 0xFF
+        else:
+            key = cv2.waitKey(1) & 0xFF
 
         # FPS更新とログ
         now = time.time()
@@ -1048,7 +1201,7 @@ def main():
                 print(f"[WARN] autosave failed: {e}")
             next_autosave = now + args.autosave_sec
 
-        key = cv2.waitKey(int(1000/(fps*min(speed,30.0)))) & 0xFF
+        # keyは既に上で取得済み
         if key in (ord('q'), 27):
             break
         elif key == ord(' '):
@@ -1095,12 +1248,13 @@ def main():
 
     # 後処理
     vw.release()
+    cap.release()  # ★ 追加：capのリリース
     cv2.destroyAllWindows()
     counter.save_csvs(args.outdir)
     stay.finalize_all(curr_idx)
     stay.save_csv(args.outdir, fps, base_ts)
     # 顔保存・一覧と埋め込み保存
-    face_keeper.save_all(args.cam_id)
+    face_keeper.save_all(args.cam_id, fps=fps, base_ts=base_ts)
     # ログのクローズ
     try:
         perf_f.close()

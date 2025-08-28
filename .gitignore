@@ -1,15 +1,12 @@
+.DS_Store
 __pycache__/
 *.pyc
-.venv/
+**/output*/
+**/merged_output*/
+**/archive_*/
 *.mp4
 *.mkv
-*.mov
-output*/
-faces/
-*_temp_clip.*
 *.npz
-*.xlsx
-*.jpg
-*.png
-# models/** (included for immediate use)
-entreecounter/
+*.npy
+faces/
+overlay.mp4
