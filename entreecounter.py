@@ -184,7 +184,8 @@ class HomographyWarp:
                               criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 30, 0.01))
         self.ok_count = len(anchors_ref)
         self.ref_anchors = anchors_ref.copy()
-        self.H_total = np.eye(3, dtype=np.float32)  # ★ 追加：基準→現在の累積
+        self.H_total = np.eye(3, dtype=np.float32)  # 基準→現在の累積
+        self.last_good_H = self.H_total.copy()
 
     def update(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -192,17 +193,36 @@ class HomographyWarp:
         good_old = self.p0[st==1].reshape(-1,2)
         good_new = p1[st==1].reshape(-1,2)
         H_inc = None
+        H_direct = None
+        st_flat = st.reshape(-1)==1 if st is not None else None
         if len(good_old)>=4:
             H_inc, mask = cv2.findHomography(good_old, good_new, cv2.RANSAC, 3.0)
             self.ok_count = int(mask.sum()) if mask is not None else len(good_old)
+            # 基準→現在の直接推定（ドリフト抑制）
+            try:
+                if st_flat is not None and np.count_nonzero(st_flat) >= 4:
+                    ref_good = self.ref_anchors.reshape(-1,2)[st_flat]
+                    H_direct, _ = cv2.findHomography(ref_good, good_new, cv2.RANSAC, 3.0)
+            except Exception:
+                H_direct = None
             if H_inc is not None:
                 # ★ 追加：累積（基準→現在）= （前→現在）×（基準→前）
                 self.H_total = (H_inc @ self.H_total).astype(np.float32)
         else:
             self.ok_count = 0
+        # 優先：直接H（安定化）。なければ累積H
+        H_use = None
+        if H_direct is not None:
+            H_use = H_direct.astype(np.float32)
+            self.H_total = H_use  # ドリフト抑制のためリセット
+        elif H_inc is not None:
+            H_use = self.H_total
+        # 状態更新
         self.prev_gray = gray
         self.p0 = p1
-        return self.H_total, good_old, good_new  # ★ 累積を返す
+        if H_use is not None:
+            self.last_good_H = H_use.copy()
+        return H_use, good_old, good_new
 
     def reinit(self, frame, anchors_ref):
         """大きくズレた場合に呼ぶ。再クリックしたアンカーで初期化"""
@@ -210,7 +230,8 @@ class HomographyWarp:
         self.p0 = anchors_ref.reshape(-1,1,2).astype(np.float32)
         self.ok_count = len(anchors_ref)
         self.ref_anchors = anchors_ref.copy()
-        self.H_total = np.eye(3, dtype=np.float32)  # ★ リセット
+        self.H_total = np.eye(3, dtype=np.float32)  # リセット
+        self.last_good_H = self.H_total.copy()
 
 def warp_shape(shape_xy, H):
     """N×2のxyをHで射影"""
