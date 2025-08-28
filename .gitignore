@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+*.mp4
+*.mkv
+*.mov
+output*/
+faces/
+*_temp_clip.*
+*.npz
+*.xlsx
+*.jpg
+*.png
+models/**
+entreecounter/
